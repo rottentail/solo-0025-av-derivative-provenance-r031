@@ -30,7 +30,8 @@ result.
 - Persistence: JSON state plus content-addressed binary files below one data
   directory
 - Public boundary: HTTP/JSON
-- Input media: PCM WAV and planar YUV4MPEG2 in the `C420` family
+- Input media: PCM WAV (plain or `WAVE_FORMAT_EXTENSIBLE`, up to eighteen
+  declared speaker positions) and planar YUV4MPEG2 in the `C420` family
 - Output media: PCM WAV and planar YUV4MPEG2 in the `C420` family
 
 ## Core entities
@@ -196,7 +197,24 @@ Audio plans:
 - `media_trim`: `start_seconds`, `duration_seconds`
 - `audio_gain`: `db`
 - `audio_normalize`: `target_peak`
+- `audio_layout`: `target_layout` or `speaker_positions` (exactly one)
 - `audio_mix`: `secondary_gain`, `primary_weight`, `secondary_weight`
+
+Audio channel semantics:
+
+- Plain PCM WAV is `mono` = front centre and `stereo` = front left/right;
+  this keeps the legacy left/right relationship and byte layout.
+- `WAVE_FORMAT_EXTENSIBLE` WAV declares a 32-bit channel mask whose ascending
+  bit order is also the interleaved sample order.
+- Channel identity is the speaker position. Sources with equal channel counts
+  but different masks are treated as different layouts.
+- Mixing maps the secondary by position onto the primary layout.
+- `audio_layout` folds every source position into the requested target
+  layout, so a stereo delivery keeps centre, surround, height, and LFE content
+  audible rather than copying the first two channels.
+- Mono and stereo deliveries use a plain PCM header; other deliveries use a
+  `WAVE_FORMAT_EXTENSIBLE` header with a matching channel mask so an
+  independent reader sees the declared positions.
 
 Video plans:
 
@@ -258,20 +276,23 @@ leaking local paths.
 
 ## Validation plan
 
-The project intentionally defers automated tests to the later task stage.
-Until that stage adds a verification suite, the following production workflow
-checks are the baseline:
+The following production workflow checks and the regression suite are the
+supported verification steps:
 
 ```bash
-python3 -m compileall -q avprovenance scripts
+python3 -m compileall -q avprovenance scripts tests
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 -m unittest discover -s tests
 ```
 
 The checks start an ephemeral HTTP server, generate bounded media bytes in
 memory, call the public endpoints, and assert observable state. They do not
-require network access or external media programs.
+require network access or external media programs. The `tests` suite covers
+`WAVE_FORMAT_EXTENSIBLE` inspection, positional mixing, layout delivery,
+legacy stereo byte compatibility, and independent reading of delivered
+channel positions.
 
 ## Intentionally omitted capabilities
 
@@ -279,4 +300,3 @@ require network access or external media programs.
 - Persistent worker processes and cross-process task leases.
 - Authentication and multi-tenant authorization.
 - Object storage and distributed state.
-- Automated tests, which belong to the later task stage.

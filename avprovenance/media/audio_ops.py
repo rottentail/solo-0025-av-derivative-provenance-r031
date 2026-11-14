@@ -1,4 +1,10 @@
-"""PCM audio operations with explicit clipping and length rules."""
+"""PCM audio operations with explicit clipping, layout, and length rules.
+
+Channel handling is loudspeaker-based, not index-based.  Two sources that
+declare the same channel count but different speaker masks are aligned by
+position; content that has no exact destination is folded by category instead
+of being dropped or assigned to an unrelated loudspeaker.
+"""
 
 from __future__ import annotations
 
@@ -6,11 +12,24 @@ import math
 from typing import Any
 
 from .errors import MediaOperationFailure
-from .wav import AudioClip, decode_wav, encode_wav, replace_channels
+from .layouts import (
+    NAMED_LAYOUTS,
+    contributions,
+    mask_for_positions,
+    positions_for_mask,
+)
+from .wav import (
+    AudioClip,
+    decode_wav,
+    encode_wav,
+    rechannel,
+    replace_channels,
+)
 
 
 PCM_MIN = -32768
 PCM_MAX = 32767
+MAX_DELIVERY_CHANNELS = 18
 
 
 def _clip_sample(value: float) -> int:
@@ -72,6 +91,137 @@ def normalize_audio(clip: AudioClip, operation: dict[str, Any]) -> AudioClip:
     )
 
 
+def _delivery_positions(operation: dict[str, Any]) -> tuple[str, ...]:
+    """Resolve a delivery operation to canonical (bit-ascending) positions."""
+    target_layout = operation.get("target_layout")
+    speaker_positions = operation.get("speaker_positions")
+    if target_layout is not None:
+        if speaker_positions is not None:
+            raise MediaOperationFailure(
+                "AUDIO_LAYOUT_AMBIGUOUS",
+                "audio_layout accepts either target_layout or speaker_positions.",
+            )
+        if not isinstance(target_layout, str):
+            raise MediaOperationFailure(
+                "AUDIO_LAYOUT_INVALID",
+                "target_layout must be a layout name.",
+            )
+        normalized = target_layout.strip().lower()
+        if normalized not in NAMED_LAYOUTS:
+            raise MediaOperationFailure(
+                "AUDIO_LAYOUT_UNKNOWN",
+                "target_layout is not a supported speaker layout.",
+            )
+        return positions_for_mask(NAMED_LAYOUTS[normalized])
+    if speaker_positions is None:
+        raise MediaOperationFailure(
+            "AUDIO_LAYOUT_MISSING",
+            "audio_layout requires target_layout or speaker_positions.",
+        )
+    if not isinstance(speaker_positions, (list, tuple)) or not speaker_positions:
+        raise MediaOperationFailure(
+            "AUDIO_LAYOUT_INVALID",
+            "speaker_positions must be a non-empty array.",
+        )
+    requested = []
+    for position in speaker_positions:
+        if not isinstance(position, str):
+            raise MediaOperationFailure(
+                "AUDIO_LAYOUT_INVALID",
+                "speaker_positions entries must be strings.",
+            )
+        requested.append(position.strip().upper())
+    if len(set(requested)) != len(requested):
+        raise MediaOperationFailure(
+            "AUDIO_LAYOUT_INVALID",
+            "speaker_positions must not repeat a position.",
+        )
+    try:
+        mask = mask_for_positions(tuple(requested))
+    except ValueError as exc:
+        raise MediaOperationFailure(
+            "AUDIO_LAYOUT_UNKNOWN",
+            "speaker_positions contains an unsupported speaker.",
+        ) from exc
+    if len(positions_for_mask(mask)) != len(requested):
+        raise MediaOperationFailure(
+            "AUDIO_LAYOUT_INVALID",
+            "speaker_positions is not a usable speaker set.",
+        )
+    return positions_for_mask(mask)
+
+
+def _rendered_layout_mask(
+    target_positions: tuple[str, ...],
+) -> int | None:
+    # Plain mono and stereo stay plain PCM: they are the canonical deliveries
+    # whose speaker positions WAVE readers already imply, and keeping them
+    # plain preserves the byte layout of legacy two-channel results.
+    if target_positions == ("FC",) or target_positions == ("FL", "FR"):
+        return None
+    return mask_for_positions(target_positions)
+
+
+def layout_audio(clip: AudioClip, operation: dict[str, Any]) -> AudioClip:
+    target_positions = _delivery_positions(operation)
+    if len(target_positions) > MAX_DELIVERY_CHANNELS:
+        raise MediaOperationFailure(
+            "AUDIO_LAYOUT_TOO_MANY_CHANNELS",
+            "The requested speaker layout exceeds the channel budget.",
+        )
+    source_positions = clip.positions
+    if len(source_positions) != clip.channel_count:
+        raise MediaOperationFailure(
+            "AUDIO_LAYOUT_SOURCE_INVALID",
+            "The source channel declaration cannot be resolved.",
+        )
+
+    rendered: list[list[float]] = [
+        [0.0] * clip.frame_count for _ in target_positions
+    ]
+    target_index = {
+        position: index for index, position in enumerate(target_positions)
+    }
+    for source_index, source_position in enumerate(source_positions):
+        routes = contributions(source_position, target_positions)
+        values = clip.channels[source_index]
+        for target_position, gain in routes:
+            destination = rendered[target_index[target_position]]
+            if gain == 1.0:
+                for frame_index, value in enumerate(values):
+                    destination[frame_index] += value
+            else:
+                for frame_index, value in enumerate(values):
+                    destination[frame_index] += value * gain
+    return rechannel(
+        clip,
+        ([_clip_sample(value) for value in channel] for channel in rendered),
+        _rendered_layout_mask(target_positions),
+    )
+
+
+def _mix_routes(
+    source_positions: tuple[str, ...],
+    target_positions: tuple[str, ...],
+) -> list[tuple[int, int, float]]:
+    """Return (source index, target index, gain) triples for a mix."""
+    target_index = {
+        position: index for index, position in enumerate(target_positions)
+    }
+    routes: list[tuple[int, int, float]] = []
+    for source_index, source_position in enumerate(source_positions):
+        # A secondary speaker with no sensible destination simply cannot be
+        # represented in the primary layout; it is not a plan failure.
+        for target_position, gain in contributions(
+            source_position,
+            target_positions,
+        ):
+            destination = target_index.get(target_position)
+            if destination is not None:
+                routes.append((source_index, destination, gain))
+    return routes
+
+
 def mix_audio(
     primary: AudioClip,
     secondary: AudioClip,
@@ -82,28 +232,49 @@ def mix_audio(
             "AUDIO_MIX_RATE_MISMATCH",
             "Mixed audio sources must share a sample rate.",
         )
-    if primary.channel_count != secondary.channel_count:
+    primary_positions = primary.positions
+    secondary_positions = secondary.positions
+    if len(primary_positions) != primary.channel_count:
         raise MediaOperationFailure(
-            "AUDIO_MIX_CHANNEL_MISMATCH",
-            "Mixed audio sources must share a channel count.",
+            "AUDIO_MIX_LAYOUT_INVALID",
+            "The primary channel declaration cannot be resolved.",
         )
+    if len(secondary_positions) != secondary.channel_count:
+        raise MediaOperationFailure(
+            "AUDIO_MIX_LAYOUT_INVALID",
+            "The secondary channel declaration cannot be resolved.",
+        )
+
     frame_count = max(primary.frame_count, secondary.frame_count)
-    primary_weight = float(operation["primary_weight"])
-    secondary_weight = float(operation["secondary_weight"])
+    primary_weight = float(operation.get("primary_weight", 1.0))
+    secondary_weight = float(operation.get("secondary_weight", 1.0))
     secondary_factor = _gain_factor(float(operation["secondary_gain"])) * secondary_weight
 
-    mixed: list[list[int]] = []
-    for channel_index in range(primary.channel_count):
-        left = primary.channels[channel_index]
-        right = secondary.channels[channel_index]
-        values: list[int] = []
-        for frame_index in range(frame_count):
-            left_value = left[frame_index] if frame_index < len(left) else 0
-            right_value = right[frame_index] if frame_index < len(right) else 0
-            combined = left_value * primary_weight + right_value * secondary_factor
-            values.append(_clip_sample(combined))
-        mixed.append(values)
-    return replace_channels(primary, mixed)
+    mixed: list[list[float]] = [
+        [0.0] * frame_count for _ in range(primary.channel_count)
+    ]
+    for channel_index, values in enumerate(primary.channels):
+        target = mixed[channel_index]
+        weight = primary_weight
+        for frame_index, value in enumerate(values):
+            target[frame_index] += value * weight
+    for source_index, target_index, gain in _mix_routes(
+        secondary_positions,
+        primary_positions,
+    ):
+        values = secondary.channels[source_index]
+        target = mixed[target_index]
+        factor = secondary_factor * gain
+        for frame_index, value in enumerate(values):
+            target[frame_index] += value * factor
+
+    return replace_channels(
+        primary,
+        (
+            [_clip_sample(value) for value in values]
+            for values in mixed
+        ),
+    )
 
 
 def render_audio(
@@ -124,6 +295,8 @@ def render_audio(
                 clip = gain_audio(clip, operation)
             elif operation_type == "audio_normalize":
                 clip = normalize_audio(clip, operation)
+            elif operation_type == "audio_layout":
+                clip = layout_audio(clip, operation)
             elif operation_type == "audio_mix":
                 if secondary is None:
                     raise MediaOperationFailure(

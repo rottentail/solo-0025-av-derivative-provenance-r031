@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from ..errors import PlanInvalid
+from ..media.layouts import NAMED_LAYOUTS, POSITION_BITS
 from ..serialization import digest_json
 from ..validation import (
     require_integer,
@@ -16,6 +17,21 @@ from ..validation import (
 
 
 MAX_OPERATIONS = 12
+MAX_DELIVERY_CHANNELS = 18
+SPEAKER_POSITION_ORDER = tuple(POSITION_BITS)
+
+# Boundary spellings accepted for loudspeaker delivery.  Every one normalizes
+# to the canonical ``audio_layout`` operation, so the plan digest depends only
+# on the requested layout and not on which alias the caller used.
+LAYOUT_OPERATION_TYPES = {
+    "audio_layout",
+    "audio_channel_layout",
+    "audio_speaker_layout",
+    "audio_downmix",
+    "audio_delivery",
+}
+LAYOUT_NAME_FIELDS = ("target_layout", "layout", "channel_layout")
+LAYOUT_POSITION_FIELDS = ("speaker_positions", "positions")
 
 
 @dataclass(frozen=True)
@@ -123,6 +139,81 @@ def _audio_mix(
     }
 
 
+def _audio_layout(operation: dict[str, Any]) -> dict[str, Any]:
+    _only_keys(
+        operation,
+        {"type", *LAYOUT_NAME_FIELDS, *LAYOUT_POSITION_FIELDS},
+        "audio_layout",
+    )
+    target_layout = None
+    for field_name in LAYOUT_NAME_FIELDS:
+        value = operation.get(field_name)
+        if value is None:
+            continue
+        if target_layout is not None:
+            raise PlanInvalid(
+                "audio_layout accepts only one target layout field."
+            )
+        target_layout = value
+    speaker_positions = None
+    for field_name in LAYOUT_POSITION_FIELDS:
+        value = operation.get(field_name)
+        if value is None:
+            continue
+        if speaker_positions is not None:
+            raise PlanInvalid(
+                "audio_layout accepts only one speaker position field."
+            )
+        speaker_positions = value
+    if (target_layout is None) == (speaker_positions is None):
+        raise PlanInvalid(
+            "audio_layout requires exactly one of target_layout or "
+            "speaker_positions."
+        )
+    normalized: dict[str, Any] = {"type": "audio_layout"}
+    if target_layout is not None:
+        name = require_string(
+            target_layout,
+            "target_layout",
+            maximum=32,
+        ).lower()
+        if name not in NAMED_LAYOUTS:
+            raise PlanInvalid(
+                "target_layout is not a supported speaker layout.",
+                details={"target_layout": name},
+            )
+        normalized["target_layout"] = name
+        return normalized
+
+    if not isinstance(speaker_positions, list) or not speaker_positions:
+        raise PlanInvalid("speaker_positions must be a non-empty array.")
+    if len(speaker_positions) > MAX_DELIVERY_CHANNELS:
+        raise PlanInvalid(
+            "speaker_positions exceeds the channel budget.",
+            details={"maximum": MAX_DELIVERY_CHANNELS},
+        )
+    positions: list[str] = []
+    for index, value in enumerate(speaker_positions):
+        position = require_string(
+            value,
+            f"speaker_positions[{index}]",
+            maximum=8,
+        ).upper()
+        if position not in POSITION_BITS:
+            raise PlanInvalid(
+                "speaker_positions contains an unsupported speaker.",
+                details={"position": position},
+            )
+        positions.append(position)
+    if len(set(positions)) != len(positions):
+        raise PlanInvalid("speaker_positions must not repeat a position.")
+    requested = set(positions)
+    normalized["speaker_positions"] = [
+        name for name in SPEAKER_POSITION_ORDER if name in requested
+    ]
+    return normalized
+
+
 def _video_trim(operation: dict[str, Any]) -> dict[str, Any]:
     _only_keys(
         operation,
@@ -201,8 +292,11 @@ def _operation_validator(
             "media_trim": _audio_trim,
             "audio_gain": _audio_gain,
             "audio_normalize": _audio_normalize,
+            **{
+                operation_type: _audio_layout
+                for operation_type in LAYOUT_OPERATION_TYPES
+            },
             "audio_mix": _audio_mix,
-            "video_crop": None,
         }
     else:
         validators = {

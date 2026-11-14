@@ -10,9 +10,11 @@ FFmpeg, network access, credentials, or an online database.
 
 ## What it does
 
-- Ingests one- or two-channel signed 16-bit PCM WAV.
+- Ingests signed 16-bit PCM WAV with one to eighteen channels, including
+  `WAVE_FORMAT_EXTENSIBLE` files that declare a speaker layout.
 - Ingests planar 4:2:0 YUV4MPEG2 in the `C420` family.
-- Applies audio trim, gain, normalization, and two-source mixing.
+- Applies audio trim, gain, normalization, layout delivery, and two-source
+  mixing.
 - Applies video trim, even-aligned crop, luma offset, and horizontal mirror.
 - Persists immutable assets, rendition state, provenance edges, and integrity
   checks.
@@ -85,7 +87,43 @@ Audio-only operations:
 - `media_trim` with `start_seconds` and `duration_seconds`
 - `audio_gain` with `db`
 - `audio_normalize` with `target_peak`
+- `audio_layout` with either `target_layout` or an explicit
+  `speaker_positions` array
 - `audio_mix` with `secondary_gain`, `primary_weight`, and `secondary_weight`
+
+`audio_layout` is how a caller delivers a target loudspeaker arrangement.
+`target_layout` accepts `mono`, `stereo`, `2.1`, `3.0`, `4.0`, `5.0`, `5.1`,
+`5.0(side)`, `5.1(side)`, `6.1`, `7.0`, and `7.1`. `speaker_positions` accepts
+a channel-count-explicit list such as `["FL", "FR", "FC", "LFE", "BL", "BR"]`;
+it is stored in WAVE channel-mask bit order.
+
+### Speaker positions and channel order
+
+Every audio descriptor reports `channel_layout` and `speaker_positions`.
+Plain PCM WAV is interpreted as `mono` = `["FC"]` and `stereo` =
+`["FL", "FR"]`, which keeps the original left/right relationship.
+`WAVE_FORMAT_EXTENSIBLE` material uses its 32-bit channel mask, and the mask
+bit order is also the interleaved sample order.
+
+Channel identity is the speaker position, never the array index. Two sources
+with the same channel count but different masks are distinct; mixing maps by
+position and folds positions that the primary layout lacks. Downmixing to
+stereo keeps centre, surround, height, and LFE content audible instead of
+copying the first two channels.
+
+Deliveries of mono and stereo are written as plain PCM WAV, and any other
+`audio_layout` target is written as `WAVE_FORMAT_EXTENSIBLE` with a matching
+channel mask. An independent reader therefore sees the same positions the
+asset descriptor and lineage report. Reproducing a rendition replays the same
+layout mapping, so an integrity check cannot silently move a pan position.
+
+```json
+{"type": "audio_layout", "target_layout": "stereo"}
+```
+
+```json
+{"type": "audio_layout", "speaker_positions": ["FL", "FR", "LFE"]}
+```
 
 Video-only operations:
 
@@ -133,6 +171,17 @@ Audio mixing plan:
     "primary_weight": 0.75,
     "secondary_weight": 0.4
   },
+  {"type": "audio_normalize", "target_peak": 0.8}
+]
+```
+
+Multi-channel delivery plan:
+
+```json
+[
+  {"type": "media_trim", "start_seconds": 0.05, "duration_seconds": 0.3},
+  {"type": "audio_gain", "db": -3},
+  {"type": "audio_layout", "target_layout": "5.1"},
   {"type": "audio_normalize", "target_peak": 0.8}
 ]
 ```
@@ -188,14 +237,19 @@ depend on HTTP or the repository.
 
 ## Workflow checks
 
-The baseline intentionally has no automated test suite. Tests are deferred to
-the later task stage, which will add red/green verification coverage. The
-current production workflow checks are:
+The production workflow checks are:
 
 ```bash
+python3 -m compileall -q avprovenance scripts tests
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+```
+
+The multichannel behavior is additionally covered by:
+
+```bash
+python3 -m unittest discover -s tests
 ```
 
 Each check starts a temporary HTTP server, generates media bytes in memory,

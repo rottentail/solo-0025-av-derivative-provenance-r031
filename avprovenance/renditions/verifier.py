@@ -21,6 +21,38 @@ class VerificationOutcome:
     reason: str | None
 
 
+def _normalized_descriptor(descriptor: dict[str, Any]) -> dict[str, Any]:
+    """Fill loudspeaker metadata absent from pre-multichannel recordings.
+
+    A descriptor persisted before speaker layouts existed still describes a
+    plain mono or stereo WAV.  Its implicit positions are deterministic, so
+    replay can compare it with a freshly inspected descriptor without
+    weakening byte or property comparison for descriptors that do declare a
+    layout.
+    """
+    properties = descriptor.get("properties")
+    if (
+        descriptor.get("kind") != "audio"
+        or descriptor.get("container") != "wav"
+        or not isinstance(properties, dict)
+        or "channel_layout" in properties
+    ):
+        return descriptor
+    channels = properties.get("channels")
+    if channels == 1:
+        layout_name, positions = "mono", ["FC"]
+    elif channels == 2:
+        layout_name, positions = "stereo", ["FL", "FR"]
+    else:
+        return descriptor
+    normalized = dict(descriptor)
+    normalized_properties = dict(properties)
+    normalized_properties["channel_layout"] = layout_name
+    normalized_properties["speaker_positions"] = positions
+    normalized["properties"] = normalized_properties
+    return normalized
+
+
 def reproduce_output(
     *,
     output_asset: MediaAsset,
@@ -29,7 +61,9 @@ def reproduce_output(
     operations: list[dict[str, Any]],
     secondary_bytes: bytes | None,
 ) -> VerificationOutcome:
-    expected_descriptor = output_asset.descriptor.to_dict()
+    expected_descriptor = _normalized_descriptor(
+        output_asset.descriptor.to_dict()
+    )
     expected_digest = output_asset.sha256
     recorded_digest = sha256_hex(recorded_output_bytes)
     if recorded_digest != expected_digest:
@@ -60,7 +94,9 @@ def reproduce_output(
         )
 
     reproduced_digest = sha256_hex(outcome.data)
-    reproduced_descriptor = outcome.descriptor.to_dict()
+    reproduced_descriptor = _normalized_descriptor(
+        outcome.descriptor.to_dict()
+    )
     if reproduced_digest != expected_digest:
         return VerificationOutcome(
             status="mismatch",
